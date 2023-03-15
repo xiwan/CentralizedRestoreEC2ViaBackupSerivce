@@ -1,0 +1,197 @@
+description: |
+  ## 简介
+  通过输入标签，过滤匹配的EC2资源，并且进行集中回复AWS Backup 服务自动化批量恢复，最后会带过去原始标签。
+
+  #### 注意： 
+
+  * Region, AvailabilityZone, VPCId, SubnetId,  SecurityGroupIds 必须保证它们匹配，不然会导致整个恢复过程失败。
+
+  * 恢复失败后，请查找执行日志里面的resotreJobId，然后去对应界面查找失败的原因，进行调整。
+
+  * 恢复失败不会导致你的备份数据丢失
+
+  * 这个资源选择备份目标的方式有两种: Tags和Arn，基于最佳实践认为Tags比较符合实际场景，故使用的是基于Tags的恢复。
+
+  * 未来会支持更多的服务，包括但不限于： rds, ebs, efs 等等
+
+  * 目前只支持最新时间点的恢复，如果需要精细粒度的恢复，请采用手工方式。
+
+  ---
+
+  ## 参数:
+
+  **AutomationAssumeRole** :  建议参考 [使用 IAM 为自动化配置角色] (https://docs.aws.amazon.com/zh_cn/systems-manager/latest/userguide/automation-setup-iam.html) 来创建运行的role。需要至少 *AmazonSSMAutomationRole*, *AWSBackupFullAccess*, *AWSBackupServiceRolePolicyForRestores*, *AWSBackupServiceRolePolicyForBackup* 的权限，trust relationships设置为：
+  ```
+  {
+      "Version": "2012-10-17",
+      "Statement": [
+          {
+              "Sid": "",
+              "Effect": "Allow",
+              "Principal": {
+                  "Service": ["ssm.amazonaws.com", "backup.amazonaws.com"]
+              },
+              "Action": "sts:AssumeRole"
+          }
+      ]
+  }
+  ```
+  **FilterTags**：过滤用的标签，比如"Patcher:benxiwan"
+
+  **ValutName**:  backup服务对应的Valut名字，默认为Default
+
+  **VPCId**: 需要恢复到的VPC, 比如*vpc-05700587b55d89574*
+
+  **SubnetId**：需要恢复到的子网, 比如*subnet-02ac249be70cb17f8*
+
+  **SecurityGroupIds** 用逗号分割的安全组(e.g. sg-xxxxxx, sg-yyyyy). 用逗号分割的安全组(e.g. sg-xxxxxx, sg-yyyyy). 如果没有指定，且在同一个区域，会沿用目前的安全组；如果去了另外一个区域， 则会使用default安全组
+
+  **AvailabilityZone**  需要恢复到哪个AZ， 比如*us-east-1b*
+
+  **Region** 是否需要更换区域, 比如*us-east-1*
+
+  **PreservePrivateIp** 是否需要保持原来的私有ip，默认为false；如果选择了true, 确保vpc的ip段正确，以及相应的ip没有被占用
+
+  ---
+
+  ## 返回：
+
+  **resJobIds** 恢复job id
+
+  **resourceIds** 恢复成功的实例
+schemaVersion: '0.3'
+assumeRole: '{{AutomationAssumeRole}}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: '(Required) The Amazon Resource Name (ARN) of the IAM role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to operate this runbook.'
+  FilterTags:
+    type: String
+    description: '(Required) 过滤用的标签，比如"patcher:benxiwan"'
+  ValutName:
+    type: String
+    default: Default
+    description: (Optional) vault 名字默认为 Default
+  VPCId:
+    type: String
+    description: (Required) Select the VPC to define the virtual networking environment.
+  SubnetId:
+    type: String
+    description: (Required) 选择子网
+  SecurityGroupIds:
+    type: String
+    default: ''
+    description: '(Optional) 用逗号分割的安全组(e.g. sg-xxxxxx, sg-yyyyy). 用逗号分割的安全组(e.g. sg-xxxxxx, sg-yyyyy). 如果没有指定，且在同一个区域，会沿用目前的安全组；如果去了另外一个区域， 则会使用default安全组'
+  AvailabilityZone:
+    type: String
+    description: (Required) 需要恢复到哪个AZ， 比如*us-east-1b*
+  Region:
+    type: String
+    description: '(Required) 是否需要更换区域, 比如*us-east-1*'
+  PreservePrivateIp:
+    type: Boolean
+    allowedValues:
+      - false
+    description: (Optional) 是否需要保留原始私有ip，默认false
+    default: false
+mainSteps:
+  - name: FilterByTags
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: "import boto3\nimport json\nimport random\nimport time\n\ndef describe_restore_job(restore):\n  return client.describe_restore_job(\n  \tRestoreJobId = restore['RestoreJobId']\n  )\n\nValidType = 'EC2'\nclient = boto3.client('backup')\n\ndef match_tags(resourceArn, filterTag):\n  Key = filterTag.split(\":\")[0]\n  Value = filterTag.split(\":\")[1]\n\n  points = client.list_recovery_points_by_resource(\n    ResourceArn=resourceArn\n  )\n  recoveryPoint = ''\n  recoveryTags = {}\n\n  # find the latest recovery point\n  for point in points['RecoveryPoints']:\n    if point['Status'] == 'COMPLETED':\n      tags = client.list_tags(\n        ResourceArn=point['RecoveryPointArn']\n      )\n      recoveryPoint = point['RecoveryPointArn']\n      recoveryTags = tags['Tags']\n\n      filter = False\n      for k,v in recoveryTags.items() :\n        if k == Key and v == Value :\n          filter = True\n      # filter out by the tags\n      if not filter :\n        recoveryTags = {}\n        recoveryPoint = ''\n      if filter:\n        break\n\n  return (recoveryPoint, recoveryTags)\n\ndef meta_modifier(events, metadata):\n  Region = events['Region']\n  AutomationAssumeRole = events['AutomationAssumeRole']\n  # ResourceArn = events['ResourceArn']\n  ValutName = events['ValutName']\n  # InstanceType = events['InstanceType']\n  VPCId = events['VPCId']\n  SubnetId = events['SubnetId']\n  AvailabilityZone = events['AvailabilityZone']\n  SecurityGroupIds = events['SecurityGroupIds']\n  PreservePrivateIp = events['PreservePrivateIp']\n  # PrivateIpAddress = events['PrivateIpAddress']\n\n  # print(json.dumps(metadata['RestoreMetadata'], indent=2))\n\n  # 修改vpcid\n  if VPCId != '':\n    metadata['RestoreMetadata']['VpcId'] =  VPCId\n  # 修改AZ\n  if AvailabilityZone != '':\n    Placement = json.loads(metadata['RestoreMetadata']['Placement'])\n    Placement['AvailabilityZone'] = AvailabilityZone\n    metadata['RestoreMetadata']['Placement'] = json.dumps(Placement)\n  # 修改InstanceType\n  # if InstanceType != '':\n  #   metadata['RestoreMetadata']['InstanceType'] =  InstanceType\n      \n  # 修改网络配置部分\n  networkInterfaces = json.loads(metadata['RestoreMetadata']['NetworkInterfaces'])\n  for interface in networkInterfaces:\n    # The associatePublicIPAddress parameter cannot be specified for a network interface with an ID.\n    del interface['AssociatePublicIpAddress']\n    # A network interface may not specify both a network interface ID and a subnet\n    del interface['NetworkInterfaceId']\n    # Only one primary private IP address can be specified.\n    del interface['PrivateIpAddress']\n\n    # 修改子网id\n    if SubnetId != '':\n      interface['SubnetId'] = SubnetId\n\n    # 修改安全组\n    if SecurityGroupIds != '':\n      interface['Groups'] = SecurityGroupIds.split(\",\")\n    else:\n      ec2client = boto3.client('ec2', region_name=Region)\n      data = ec2client.describe_security_groups(\n        Filters=[\n          {\n              'Name': 'vpc-id', 'Values': [VPCId]\n          },\n          {\n              'Name': 'group-name', 'Values': [\"default\"]\n          }\n        ]\n      )\n      interface['Groups'] = [data[\"SecurityGroups\"][0][\"GroupId\"]]\n\n    # # 修改私有地址\n    # if PrivateIpAddress != '':\n    #   for ipaddress in interface['PrivateIpAddresses']:\n    #     if ipaddress['Primary'] is True:\n    #       ipaddress['PrivateIpAddress'] = PrivateIpAddress\n    #       break\n    # else:\n    # # 随机私有地址\n    #   del interface['PrivateIpAddresses']\n\n    if PreservePrivateIp:\n      for ipaddress in interface['PrivateIpAddresses']:\n        if ipaddress['Primary'] is True:\n          print(ipaddress['PrivateIpAddress'])\n          break\n      pass\n    else:\n      # 删除私有地址\n      del interface['PrivateIpAddresses']\n      pass\n          \n    # Value (0) for parameter secondaryPrivateIpAddressCount is invalid. Value must be a positive number.\n    interface['secondaryPrivateIpAddressCount'] = 1\n    break\n\n  metadata['RestoreMetadata']['NetworkInterfaces'] = json.dumps(networkInterfaces)\n\n  insType = metadata['RestoreMetadata']['InstanceType'] \n  # print(insType)\n  if insType.startswith( 't' ):\n    # t 系列需要保留\n    metadata['RestoreMetadata']['CreditSpecification'] = json.dumps({'CpuCredits': 'standard'})\n    del metadata['RestoreMetadata']['CpuOptions']\n  else:\n    # 非 t 系列\n    # del metadata['RestoreMetadata']['CpuOptions']\n    pass\n\n  # 去掉不需要的字段\n  del metadata['RestoreMetadata']['IamInstanceProfileName']\n  del metadata['RestoreMetadata']['SecurityGroupIds']\n  del metadata['RestoreMetadata']['SubnetId']\n\n  # print(recoveryPoint)\n  # print(type(metadata['RestoreMetadata']))\n  # print(json.dumps(metadata['RestoreMetadata'], indent=2))\n\n  pass\n\n\ndef script_handler(events, context):\n  Region = events['Region']\n  AutomationAssumeRole = events['AutomationAssumeRole']\n  FilterTags = events['FilterTags']\n  ValutName = events['ValutName']\n  # InstanceType = events['InstanceType']\n  VPCId = events['VPCId']\n  SubnetId = events['SubnetId']\n  AvailabilityZone = events['AvailabilityZone']\n  SecurityGroupIds = events['SecurityGroupIds']\n  PreservePrivateIp = events['PreservePrivateIp']\n  # PrivateIpAddress = events['PrivateIpAddress']\n  \n  print(AutomationAssumeRole)\n\n  # create service client using the assumed role credentials, e.g. S3\n  client = boto3.client('backup', region_name=Region)\n\n  RestoreJobIds = []\n  recoveryTags = {}\n  resources = client.list_protected_resources()\n  for res in resources['Results'] :\n    # only support EC2 now\n\n    if res['ResourceType'] == ValidType :\n      recoveryPoint, recoveryTag = match_tags(res['ResourceArn'], FilterTags)\n      print(recoveryPoint)\n      print(recoveryTag)\n\n      if recoveryPoint == '' :\n        print('recoveryPoint not exit')\n        continue\n\n      metadata = client.get_recovery_point_restore_metadata(\n        BackupVaultName = ValutName,\n        RecoveryPointArn = recoveryPoint\n      )\n\n      meta_modifier(events, metadata)\n      # continue\n\n      # start the restore job\n      restore = client.start_restore_job(\n        RecoveryPointArn = recoveryPoint,\n        IamRoleArn = AutomationAssumeRole,\n        Metadata = metadata['RestoreMetadata'],\n        ResourceType = ValidType\n      )\n      RestoreJobIds.append(restore['RestoreJobId'])\n      recoveryTags[restore['RestoreJobId']] = recoveryTag\n\n      pass\n\n  # print(RestoreJobIds)\n  # print(recoveryTags)\n\n  return {'recoveryTags': recoveryTags, 'restoreJobIds': RestoreJobIds, 'region': Region}"
+      InputPayload:
+        AutomationAssumeRole: '{{AutomationAssumeRole}}'
+        FilterTags: '{{FilterTags}}'
+        ValutName: '{{ValutName}}'
+        VPCId: '{{VPCId}}'
+        SubnetId: '{{SubnetId}}'
+        SecurityGroupIds: '{{SecurityGroupIds}}'
+        AvailabilityZone: '{{AvailabilityZone}}'
+        Region: '{{Region}}'
+        PreservePrivateIp: '{{PreservePrivateIp}}'
+    outputs:
+      - Selector: $.Payload.recoveryTags
+        Name: recoveryTags
+        Type: StringMap
+      - Selector: $.Payload.restoreJobIds
+        Name: restoreJobIds
+        Type: StringList
+      - Name: region
+        Selector: $.Payload.region
+        Type: String
+  - name: TagInstances
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import boto3
+        import json
+        import random
+        import time
+
+        def script_handler(events, context):
+          recoveryTags = events['recoveryTags']
+          restoreJobIds = events['restoreJobIds']
+          region = events['region']
+          
+          client = boto3.client('backup')
+          ec2client = boto3.client('ec2', region_name=region)
+          
+          resourceIds = []
+          resJobIds = []
+          finishedJobs = [0] * len(restoreJobIds)
+          while True:
+            for idx, resJobId in enumerate(restoreJobIds):
+              data = client.describe_restore_job(
+                RestoreJobId = resJobId
+              )
+
+              if not recoveryTags[resJobId]:
+                continue
+
+              print(resJobId + '|' + data['Status'])
+              if data['Status'] != 'PENDING' and data['Status'] != 'RUNNING' :
+                pass
+
+              if data['Status'] == 'COMPLETED' and data['CreatedResourceArn'] != '' and finishedJobs[idx] == 0:
+                finishedJobs[idx] = 1
+                # print(recoveryTags[resJobId])
+                Tags = []
+                for k,v in recoveryTags[resJobId].items():
+                  if k.startswith("aws:"):
+                    continue
+                  tag = {'Key': k, 'Value': v}
+                  Tags.append(tag)
+                print(Tags)
+
+                resourceId = data['CreatedResourceArn'].split("/")[1]
+                
+                response = ec2client.create_tags(
+                  Resources = [resourceId],
+                  Tags = Tags
+                )
+
+                if not resourceId in resourceIds:
+                  resourceIds.append(resourceId)
+                if not resJobId in resJobIds:
+                  resJobIds.append(resJobId)
+
+            time.sleep(1)
+            if sum(finishedJobs) == len(restoreJobIds):
+              break
+            
+          return {'resourceIds': resourceIds, 'resJobIds': resJobIds}
+      InputPayload:
+        recoveryTags: '{{FilterByTags.recoveryTags}}'
+        restoreJobIds: '{{FilterByTags.restoreJobIds}}'
+        region: '{{FilterByTags.region}}'
+    outputs:
+      - Selector: $.Payload.resourceIds
+        Name: resourceIds
+        Type: StringList
+      - Name: resJobIds
+        Selector: $.Payload.resJobIds
+        Type: StringList
